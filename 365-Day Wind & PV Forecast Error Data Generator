@@ -1,0 +1,140 @@
+# =============================================================================
+# 365-Day Wind & PV Forecast Error Data Generator
+# =============================================================================
+# Models correlated, temporally-autocorrelated forecast errors for:
+#   4 MGs × 24 hours × 365 days
+#
+# Physics:
+#   Wind errors:   larger std, higher autocorrelation, diurnal pattern
+#   PV errors:     smaller std, zero at night, peak at noon
+#   Cross-MG:      moderate correlation (weather fronts)
+#   Temporal:      AR(1) process within each day
+# =============================================================================
+import numpy as np
+import json
+import os
+
+np.random.seed(42)
+
+OUTDIR = os.path.dirname(os.path.abspath(__file__))
+
+# Per-MG installed capacities
+MG_CAPS = {
+    1: {"WT": 2.0, "PV": 1.8},
+    2: {"WT": 2.5, "PV": 1.5},
+    3: {"WT": 1.5, "PV": 1.0},
+    4: {"WT": 3.0, "PV": 2.0},
+}
+
+# Error standard deviations (fraction of installed capacity)
+SIGMA_WT = 0.15  # 15%
+SIGMA_PV = 0.10  # 10%
+
+# Cross-MG correlation matrix (weather-driven)
+RHO_MG = np.array([
+    [1.00, 0.55, 0.35, 0.50],
+    [0.55, 1.00, 0.30, 0.60],
+    [0.35, 0.30, 1.00, 0.40],
+    [0.50, 0.60, 0.40, 1.00],
+])
+# Cholesky for generating correlated samples
+L_MG = np.linalg.cholesky(RHO_MG)
+
+# Temporal autocorrelation (AR(1) coefficient)
+AR1_WT = 0.70   # wind persistance
+AR1_PV = 0.50   # solar less persistent
+
+# Diurnal modulation (error larger when generation is larger)
+def diurnal_modulation_WT(hour):
+    """Wind error scaling vs hour. Returns factor 0.7 ~ 1.3."""
+    return 0.85 + 0.30 * np.cos(2 * np.pi * (hour - 3) / 24)
+
+def diurnal_modulation_PV(hour):
+    """PV error scaling: zero at night, proportional to irradiance."""
+    if hour < 6 or hour > 18:
+        return 0.0
+    return np.sin(np.pi * (hour - 6) / 12) ** 1.0
+
+# Generate
+DAYS = 365
+HOURS = 24
+N_MG = 4
+
+training_data = {}
+
+for resource, ar1, sigma, diurnal_fn in [
+    ("WT", AR1_WT, SIGMA_WT, diurnal_modulation_WT),
+    ("PV", AR1_PV, SIGMA_PV, diurnal_modulation_PV),
+]:
+    raw = np.zeros((DAYS, N_MG, HOURS))
+
+    for mg in range(N_MG):
+        cap = MG_CAPS[mg + 1][resource]
+        eps_std = sigma * cap
+
+        for day in range(DAYS):
+            # Independent cross-MG innovation at t=0
+            z = np.random.randn(N_MG)
+            z_corr = L_MG @ z
+            eps_prev = z_corr[mg] * eps_std * 0.3
+
+            for hour in range(HOURS):
+                dmod = max(diurnal_fn(hour), 0.01)
+
+                if hour == 0:
+                    # Start-of-day: correlated across MGs
+                    z_all = np.random.randn(N_MG)
+                    z_corr_all = L_MG @ z_all
+                    innovation = z_corr_all[mg] * eps_std
+                else:
+                    innovation = np.random.randn() * eps_std * np.sqrt(1 - ar1**2)
+
+                eps_current = ar1 * eps_prev + innovation
+                raw[day, mg, hour] = eps_current * dmod
+                eps_prev = eps_current
+
+    training_data[resource] = raw
+
+# ---- Export to Excel-ready arrays ----
+# Shape: (days * MGs, hours) for easy tabulation
+# Also save as numpy for programmatic use
+
+OUT_NPY = os.path.join(OUTDIR, "training_data_365d.npz")
+np.savez_compressed(
+    OUT_NPY,
+    WT=training_data["WT"],
+    PV=training_data["PV"],
+    MG_caps_WT=np.array([MG_CAPS[m]["WT"] for m in range(1, 5)]),
+    MG_caps_PV=np.array([MG_CAPS[m]["PV"] for m in range(1, 5)]),
+    sigma_WT=SIGMA_WT,
+    sigma_PV=SIGMA_PV,
+    AR1_WT=AR1_WT,
+    AR1_PV=AR1_PV,
+    RHO_MG=RHO_MG,
+)
+
+# ---- Summary statistics ----
+print("365-Day Training Data Generated")
+print(f"  File: {OUT_NPY}")
+print()
+for res in ["WT", "PV"]:
+    data = training_data[res]
+    print(f"  {res} forecast errors (MW):")
+    print(f"    Global mean:   {data.mean():.5f}")
+    print(f"    Global std:    {data.std():.4f}")
+    for mg in range(N_MG):
+        mg_data = data[:, mg, :]
+        print(f"    MG{mg+1}: mean={mg_data.mean():+.5f}, std={mg_data.std():.4f}, "
+              f"min={mg_data.min():+.4f}, max={mg_data.max():+.4f}")
+    print()
+
+print("  Cross-MG correlations (all hours pooled):")
+for res in ["WT", "PV"]:
+    data = training_data[res]
+    flat = data.reshape(DAYS * HOURS, N_MG)
+    corr = np.corrcoef(flat.T)
+    print(f"  {res}:")
+    print(f"    [[{corr[0,0]:.2f}, {corr[0,1]:.2f}, {corr[0,2]:.2f}, {corr[0,3]:.2f}]")
+    print(f"     [{corr[1,0]:.2f}, {corr[1,1]:.2f}, {corr[1,2]:.2f}, {corr[1,3]:.2f}]")
+    print(f"     [{corr[2,0]:.2f}, {corr[2,1]:.2f}, {corr[2,2]:.2f}, {corr[2,3]:.2f}]")
+    print(f"     [{corr[3,0]:.2f}, {corr[3,1]:.2f}, {corr[3,2]:.2f}, {corr[3,3]:.2f}]]")
